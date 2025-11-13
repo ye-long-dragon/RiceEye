@@ -14,15 +14,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import kotlin.math.roundToInt
 
 class RiceDetectorLoading : AppCompatActivity() {
 
     private lateinit var progressBar: ProgressBar
     private lateinit var loadingText: TextView
     private lateinit var backgroundImage: ImageView
+    private lateinit var interpreter: Interpreter
+
+    private val classNames = listOf("Dinorado", "Jasmine", "Malagkit", "Sinadomeng", "V160")
+    private val inputSize = 224
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,98 +40,96 @@ class RiceDetectorLoading : AppCompatActivity() {
         val imageUriString = intent.getStringExtra("imageUri") ?: return
         val imageUri = Uri.parse(imageUriString)
 
-        // Show selected image in background
         contentResolver.openInputStream(imageUri)?.use { inputStream ->
             val bitmap = BitmapFactory.decodeStream(inputStream)
             backgroundImage.setImageBitmap(bitmap)
+        }
 
-            lifecycleScope.launch {
-                try {
-                    loadingText.text = "Analyzing..."
-                    val results = runModel(bitmap)
-                    loadingText.text = "Analysis complete!"
-
-                    // Go to RiceResult screen
-                    startActivity(
-                        RiceResult.newIntent(
-                            this@RiceDetectorLoading,
-                            results,
-                            imageUri
-                        )
-                    )
-                    finish()
-                } catch (e: Exception) {
-                    android.util.Log.e("RiceEye", "Error running model", e)
-                    loadingText.text = "Model error: ${e.message}"
+        lifecycleScope.launch {
+            try {
+                loadingText.text = "Initializing model..."
+                withContext(Dispatchers.IO) {
+                    interpreter = Interpreter(loadModelFile("rice_model.tflite"))
                 }
-            }
 
+                loadingText.text = "Analyzing image..."
+                progressBar.isIndeterminate = true
+
+                val (label, topConf, allScores) = runClassificationFromBitmap(imageUri)
+
+                loadingText.text =
+                    "Detected: $label\nConfidence: ${"%.2f".format(topConf * 100)}%"
+
+                // Launch results screen
+                startActivity(
+                    RiceResult.newIntentWithConfidences(
+                        this@RiceDetectorLoading,
+                        label,
+                        topConf,
+                        allScores,
+                        imageUri
+                    )
+                )
+                finish()
+            } catch (e: Exception) {
+                android.util.Log.e("RiceEye", "Error running model", e)
+                loadingText.text = "Model error: ${e.message}"
+            }
         }
     }
 
-    // ------------------------- TensorFlow Lite Model -------------------------
-    private suspend fun runModel(bitmap: Bitmap): List<Pair<String, Float>> =
-        withContext(Dispatchers.Default) {
-            // Load model file from assets
-            val modelFile = loadModelFile("best_float32.tflite")
-            val interpreter = Interpreter(modelFile)
+    private suspend fun runClassificationFromBitmap(imageUri: Uri)
+            : Triple<String, Float, FloatArray> = withContext(Dispatchers.Default) {
 
-            // Prepare input data
-            val inputSize = 640
-            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        val bitmap = contentResolver.openInputStream(imageUri)?.use {
+            BitmapFactory.decodeStream(it)
+        } ?: throw IllegalStateException("Failed to load image")
 
-            val inputData = Array(1) {
-                Array(inputSize) {
-                    Array(inputSize) {
-                        FloatArray(3)
-                    }
-                }
+        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+
+        // Prepare input tensor
+        val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
+        inputBuffer.order(ByteOrder.nativeOrder())
+
+        for (y in 0 until inputSize) {
+            for (x in 0 until inputSize) {
+                val px = scaled.getPixel(x, y)
+                inputBuffer.putFloat(((px shr 16) and 0xFF) / 255f)
+                inputBuffer.putFloat(((px shr 8) and 0xFF) / 255f)
+                inputBuffer.putFloat((px and 0xFF) / 255f)
             }
-
-            for (y in 0 until inputSize) {
-                for (x in 0 until inputSize) {
-                    val px = scaledBitmap.getPixel(x, y)
-                    inputData[0][y][x][0] = ((px shr 16) and 0xFF) / 255f
-                    inputData[0][y][x][1] = ((px shr 8) and 0xFF) / 255f
-                    inputData[0][y][x][2] = (px and 0xFF) / 255f
-                }
-            }
-
-            // Prepare output tensor [1, N, 6]
-            val output = Array(1) { Array(300) { FloatArray(6) } }
-
-
-            // Run inference
-            interpreter.run(inputData, output)
-
-            // Decode: (xmin, ymin, xmax, ymax, conf, class_id)
-            val names = listOf("Jasmine", "Sinandomeng", "Malagkit", "Dinorado", "V-160")
-            val confThres = 0.25f
-            val detections = mutableListOf<Pair<String, Float>>()
-
-            for (det in output[0]) {
-                val conf = det[4]
-                val clsId = det[5]
-                if (conf < confThres) continue
-                val label = names.getOrElse(clsId.roundToInt()) { "cls${clsId.roundToInt()}" }
-                detections.add(label to conf)
-            }
-
-            interpreter.close()
-            detections
         }
 
+        val output = Array(1) { FloatArray(classNames.size) }
+        interpreter.run(inputBuffer, output)
+        val scores = output[0]
+
+        var bestIdx = 0
+        var bestScore = scores[0]
+        for (i in 1 until scores.size) {
+            if (scores[i] > bestScore) {
+                bestScore = scores[i]
+                bestIdx = i
+            }
+        }
+
+        Triple(classNames[bestIdx], bestScore, scores)
+    }
+
     private fun loadModelFile(modelName: String): MappedByteBuffer {
-        val assetFileDescriptor = assets.openFd(modelName)
-        FileInputStream(assetFileDescriptor.fileDescriptor).use { input ->
-            val channel = input.channel
+        val afd = assets.openFd(modelName)
+        FileInputStream(afd.fileDescriptor).use { fis ->
+            val channel = fis.channel
             return channel.map(
                 FileChannel.MapMode.READ_ONLY,
-                assetFileDescriptor.startOffset,
-                assetFileDescriptor.declaredLength
+                afd.startOffset,
+                afd.declaredLength
             )
         }
     }
 
-
+    override fun onDestroy() {
+        if (::interpreter.isInitialized) interpreter.close()
+        super.onDestroy()
+    }
 }

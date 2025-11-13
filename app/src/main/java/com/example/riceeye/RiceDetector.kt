@@ -23,8 +23,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.util.*
 
 class RiceDetector : AppCompatActivity() {
 
@@ -33,9 +32,9 @@ class RiceDetector : AppCompatActivity() {
     private lateinit var btnSelect: Button
     private lateinit var btnAnalyze: Button
     private lateinit var btnSave: Button
+    private lateinit var btnBack: Button
 
     private var selectedImageUri: Uri? = null
-    private var photoUri: Uri? = null
     private var currentPhotoPath: String? = null
 
     private val REQUEST_CAMERA = 1001
@@ -50,32 +49,35 @@ class RiceDetector : AppCompatActivity() {
         btnSelect = findViewById(R.id.btnSelect)
         btnAnalyze = findViewById(R.id.btnAnalyze)
         btnSave = findViewById(R.id.btnSave)
+        btnBack = findViewById(R.id.btnBack)
 
         btnCapture.setOnClickListener { capturePhoto() }
         btnSelect.setOnClickListener { selectFromGallery() }
         btnAnalyze.setOnClickListener { analyzeImage() }
-        btnSave.setOnClickListener { saveImage() }   // ✅ Save to database
-        val btnBack: Button = findViewById(R.id.btnBack)
-        btnBack.setOnClickListener {
-            // Return to previous screen (MainActivity)
-            finish()
-        }
-
+        btnSave.setOnClickListener { saveImageToDatabase() }
+        btnBack.setOnClickListener { finish() }
     }
 
     // ----------------------------------------------------------------------
-    // Camera & Gallery
+    // Camera & Gallery Selection
     // ----------------------------------------------------------------------
 
     private fun capturePhoto() {
-        val photoFile = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "captured_image.jpg")
+        val photoFile = File(
+            getExternalFilesDir(Environment.DIRECTORY_PICTURES),
+            "captured_image_${System.currentTimeMillis()}.jpg"
+        )
         currentPhotoPath = photoFile.absolutePath
-        photoUri = FileProvider.getUriForFile(this, "$packageName.provider", photoFile)
+        val photoUri = FileProvider.getUriForFile(
+            this,
+            "$packageName.provider",
+            photoFile
+        )
 
-        val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
-        intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri)
-        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        startActivityForResult(intent, REQUEST_CAMERA)
+        val camIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+        camIntent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri)
+        camIntent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        startActivityForResult(camIntent, REQUEST_CAMERA)
     }
 
     private fun selectFromGallery() {
@@ -85,75 +87,71 @@ class RiceDetector : AppCompatActivity() {
     }
 
     // ----------------------------------------------------------------------
-    // Handle Image Results
+    // Handle image result callbacks
     // ----------------------------------------------------------------------
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != Activity.RESULT_OK) return
 
-        if (resultCode == Activity.RESULT_OK) {
-            when (requestCode) {
-                REQUEST_CAMERA -> {
-                    currentPhotoPath?.let { path ->
-                        val bitmap = BitmapFactory.decodeFile(path)
-                        val rotatedBitmap = fixImageOrientation(path, bitmap)
-                        imagePreview.setImageBitmap(rotatedBitmap)
+        when (requestCode) {
+            REQUEST_CAMERA -> currentPhotoPath?.let { path ->
+                val bitmap = BitmapFactory.decodeFile(path)
+                val rotated = fixOrientation(path, bitmap)
+                displayAndCache(rotated, "camera_rotated_${System.currentTimeMillis()}.jpg")
+            }
 
-                        val rotatedFile = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "captured_rotated.jpg")
-                        saveBitmapToFile(rotatedBitmap, rotatedFile)
-
-                        selectedImageUri = FileProvider.getUriForFile(this, "$packageName.provider", rotatedFile)
-                    }
-                }
-                REQUEST_GALLERY -> {
-                    val uri = data?.data ?: return
-                    val rotatedBitmap = fixImageOrientationFromUri(uri)
-                    imagePreview.setImageBitmap(rotatedBitmap)
-
-                    val rotatedFile = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "gallery_rotated.jpg")
-                    saveBitmapToFile(rotatedBitmap, rotatedFile)
-
-                    selectedImageUri = FileProvider.getUriForFile(this, "$packageName.provider", rotatedFile)
-                }
+            REQUEST_GALLERY -> {
+                val uri = data?.data ?: return
+                val rotated = fixOrientationFromUri(uri)
+                displayAndCache(rotated, "gallery_rotated_${System.currentTimeMillis()}.jpg")
             }
         }
     }
 
+    private fun displayAndCache(bitmap: Bitmap, fileName: String) {
+        imagePreview.setImageBitmap(bitmap)
+        val outFile = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), fileName)
+        saveBitmap(bitmap, outFile)
+        selectedImageUri = FileProvider.getUriForFile(this, "$packageName.provider", outFile)
+    }
+
     // ----------------------------------------------------------------------
-    // Orientation Helpers
+    // Orientation & Save Helpers
     // ----------------------------------------------------------------------
 
-    private fun fixImageOrientation(photoPath: String, bitmap: Bitmap): Bitmap {
+    private fun fixOrientation(path: String, bmp: Bitmap): Bitmap {
         return try {
-            val exif = ExifInterface(photoPath)
-            val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
-            val matrix = Matrix()
+            val exif = ExifInterface(path)
+            val orientation = exif.getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
+            val m = Matrix()
             when (orientation) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> m.postRotate(270f)
             }
-            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-        } catch (e: IOException) {
-            e.printStackTrace()
-            bitmap
+            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        } catch (e: Exception) {
+            bmp
         }
     }
 
-    private fun fixImageOrientationFromUri(uri: Uri): Bitmap {
-        val inputStream = contentResolver.openInputStream(uri)
-        val bitmap = BitmapFactory.decodeStream(inputStream)
-        inputStream?.close()
-        val tempFile = File.createTempFile("temp_image", ".jpg", cacheDir)
-        saveBitmapToFile(bitmap, tempFile)
-        return fixImageOrientation(tempFile.absolutePath, bitmap)
+    private fun fixOrientationFromUri(uri: Uri): Bitmap {
+        val input = contentResolver.openInputStream(uri)
+        val bmp = BitmapFactory.decodeStream(input)
+        input?.close()
+        val tmp = File.createTempFile("temp_img", ".jpg", cacheDir)
+        saveBitmap(bmp, tmp)
+        return fixOrientation(tmp.absolutePath, bmp)
     }
 
-    private fun saveBitmapToFile(bitmap: Bitmap, file: File) {
+    private fun saveBitmap(bmp: Bitmap, file: File) {
         try {
             FileOutputStream(file).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                out.flush()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
             }
         } catch (e: IOException) {
             e.printStackTrace()
@@ -161,49 +159,40 @@ class RiceDetector : AppCompatActivity() {
     }
 
     // ----------------------------------------------------------------------
-    // Actions
+    // Analyze & Save
     // ----------------------------------------------------------------------
 
     private fun analyzeImage() {
         if (selectedImageUri == null) {
-            Toast.makeText(this, "Please select or capture an image first", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Please select or capture an image first.", Toast.LENGTH_SHORT).show()
             return
         }
-
         val intent = Intent(this, RiceDetectorLoading::class.java)
         intent.putExtra("imageUri", selectedImageUri.toString())
         startActivity(intent)
     }
 
-    // ✅ Save the selected image URI into Room database
-    private fun saveImage() {
+    private fun saveImageToDatabase() {
         if (selectedImageUri == null) {
             Toast.makeText(this, "No image to save!", Toast.LENGTH_SHORT).show()
             return
         }
 
         val date = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-
         lifecycleScope.launch {
             val db = AppDatabase.getDatabase(this@RiceDetector)
             val dao = db.analysisResultDao()
 
-            // Save with placeholders for result and confidence (since analysis not done yet)
-            val result = AnalysisResult(
+            val record = AnalysisResult(
                 date = date,
                 imageUri = selectedImageUri.toString(),
                 result = "Unanalyzed Image",
                 confidenceLevel = "N/A"
             )
-
-            dao.insert(result)
+            dao.insert(record)
 
             runOnUiThread {
-                Toast.makeText(
-                    this@RiceDetector,
-                    "Image saved to database!",
-                    Toast.LENGTH_SHORT
-                ).show()
+                Toast.makeText(this@RiceDetector, "Image saved successfully!", Toast.LENGTH_SHORT).show()
             }
         }
     }
